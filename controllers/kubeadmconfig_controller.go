@@ -25,6 +25,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	bootstrapv1 "sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/api/v1alpha2"
@@ -55,7 +56,7 @@ type SecretsClientFactory interface {
 }
 
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kubeadmconfigs;kubeadmconfigs/status,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status;machines;machines/status,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status;machines;machines/status;machinepools;machinepools/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets;events;configmaps,verbs=get;list;watch;create;update;patch;delete
 
 // KubeadmConfigReconciler reconciles a KubeadmConfig object
@@ -74,6 +75,12 @@ func (r *KubeadmConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&source.Kind{Type: &clusterv1.Machine{}},
 			&handler.EnqueueRequestsFromMapFunc{
 				ToRequests: handler.ToRequestsFunc(r.MachineToBootstrapMapFunc),
+			},
+		).
+		Watches(
+			&source.Kind{Type: &clusterv1.MachinePool{}},
+			&handler.EnqueueRequestsFromMapFunc{
+				ToRequests: handler.ToRequestsFunc(r.MachinePoolToBootstrapMapFunc),
 			},
 		).
 		Watches(
@@ -106,14 +113,28 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 		log.Error(err, "could not get owner machine")
 		return ctrl.Result{}, err
 	}
-	if machine == nil {
-		log.Info("Waiting for Machine Controller to set OwnerRef on the KubeadmConfig")
+	// Look up the Machine that owns this KubeConfig if there is one
+	machinepool, err := util.GetOwnerMachinePool(ctx, r.Client, config.ObjectMeta)
+	if err != nil {
+		log.Error(err, "could not get owner machine pool")
+		return ctrl.Result{}, err
+	}
+	if machine == nil && machinepool == nil {
+		log.Info("Waiting for Machine/MachinePool Controller to set OwnerRef on the KubeadmConfig")
 		return ctrl.Result{}, nil
 	}
-	log = log.WithValues("machine-name", machine.Name)
+
+	var owner metav1.ObjectMeta
+	if machine != nil {
+		owner = machine.ObjectMeta
+		log = log.WithValues("machine-name", machine.Name)
+	} else if machinepool != nil {
+		owner = machinepool.ObjectMeta
+		log = log.WithValues("machinepool-name", machinepool.Name)
+	}
 
 	// Lookup the cluster the machine is associated with
-	cluster, err := util.GetClusterFromMetadata(ctx, r.Client, machine.ObjectMeta)
+	cluster, err := util.GetClusterFromMetadata(ctx, r.Client, owner)
 	if err != nil {
 		if errors.Cause(err) == util.ErrNoCluster {
 			log.Info("Machine does not belong to a cluster yet, waiting until its part of a cluster")
@@ -134,11 +155,13 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 		log.Info("Infrastructure is not ready, waiting until ready.")
 		return ctrl.Result{}, nil
 	// bail super early if it's already ready
-	case config.Status.Ready && machine.Status.InfrastructureReady:
+	case config.Status.Ready && machine != nil && machine.Status.InfrastructureReady:
+	case config.Status.Ready && machinepool != nil && machinepool.Status.InfrastructureReady:
 		log.Info("ignoring config for an already ready machine")
 		return ctrl.Result{}, nil
 	// Reconcile status for machines that have already copied bootstrap data
-	case machine.Spec.Bootstrap.Data != nil && !config.Status.Ready:
+	case machine != nil && machine.Spec.Bootstrap.Data != nil && !config.Status.Ready:
+	case machinepool != nil && machinepool.Spec.Template.Spec.Bootstrap.Data != nil && !config.Status.Ready:
 		config.Status.Ready = true
 		// Initialize the patch helper
 		patchHelper, err := patch.NewHelper(config, r)
@@ -185,7 +208,7 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 
 	if !cluster.Status.ControlPlaneInitialized {
 		// if it's NOT a control plane machine, requeue
-		if !util.IsControlPlaneMachine(machine) {
+		if machine == nil || !util.IsControlPlaneMachine(machine) {
 			log.Info(fmt.Sprintf("Machine is not a control plane. If it should be a control plane, add `%s: true` as a label to the Machine", clusterv1.MachineControlPlaneLabelName))
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
@@ -292,7 +315,7 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 	}
 
 	// it's a control plane join
-	if util.IsControlPlaneMachine(machine) {
+	if machine != nil && util.IsControlPlaneMachine(machine) {
 		if config.Spec.JoinConfiguration.ControlPlane == nil {
 			config.Spec.JoinConfiguration.ControlPlane = &kubeadmv1beta1.JoinControlPlane{}
 		}
@@ -440,6 +463,22 @@ func (r *KubeadmConfigReconciler) MachineToBootstrapMapFunc(o handler.MapObject)
 	}
 	if m.Spec.Bootstrap.ConfigRef != nil && m.Spec.Bootstrap.ConfigRef.GroupVersionKind() == bootstrapv1.GroupVersion.WithKind("KubeadmConfig") {
 		name := client.ObjectKey{Namespace: m.Namespace, Name: m.Spec.Bootstrap.ConfigRef.Name}
+		result = append(result, ctrl.Request{NamespacedName: name})
+	}
+	return result
+}
+
+// MachinePoolToBootstrapMapFunc is a handler.ToRequestsFunc to be used to enqeue
+// request for reconciliation of KubeadmConfig.
+func (r *KubeadmConfigReconciler) MachinePoolToBootstrapMapFunc(o handler.MapObject) []ctrl.Request {
+	result := []ctrl.Request{}
+
+	m, ok := o.Object.(*clusterv1.MachinePool)
+	if !ok {
+		return nil
+	}
+	if m.Spec.Template.Spec.Bootstrap.ConfigRef != nil && m.Spec.Template.Spec.Bootstrap.ConfigRef.GroupVersionKind() == bootstrapv1.GroupVersion.WithKind("KubeadmConfig") {
+		name := client.ObjectKey{Namespace: m.Namespace, Name: m.Spec.Template.Spec.Bootstrap.ConfigRef.Name}
 		result = append(result, ctrl.Request{NamespacedName: name})
 	}
 	return result
